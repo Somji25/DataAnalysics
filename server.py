@@ -7,6 +7,8 @@ import numpy as np
 import easyocr
 import collections
 import base64
+import gc      # สำหรับจัดการขยะใน RAM
+import torch   # สำหรับคุม Memory ของ AI
 from flask import Flask, render_template, request, redirect, url_for, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from ultralytics import YOLO
@@ -16,28 +18,27 @@ app = Flask(__name__)
 
 # ====== 1. ตั้งค่าฐานข้อมูล PostgreSQL & โมเดล ======
 
-# ดึงค่า URL จาก Environment Variable (สำหรับตอนรันบน Render)
 db_url = os.getenv('DATABASE_URL')
-
 if db_url:
-    # ถ้าอยู่บน Render ระบบจะส่ง postgres:// มาให้ ต้องแก้เป็น postgresql://
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
     app.config['SQLALCHEMY_DATABASE_URI'] = db_url
 else:
-    # กรณีรันในเครื่องตัวเอง (Local) ให้ใช้ Link โดยตรงไปยัง Database บน Render
     app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://car_detection_db_user:PSf3eBnctkAHjigt6NejbtrCpuopVwL1@dpg-d75nnnruibrs73br3dkg-a.singapore-postgres.render.com/car_detection_db'
 
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-
 db = SQLAlchemy(app)
 
-# โหลดโมเดล AI (ใช้ Path แบบ Relative)
+# โหลดโมเดล AI และบังคับใช้ CPU (ประหยัด RAM กว่า GPU บน Server ฟรี)
 MODEL_CAR_PATH = os.path.join("models", "best.pt")
 MODEL_PLATE_PATH = os.path.join("models", "License.pt")
 
 model_car = YOLO(MODEL_CAR_PATH) 
 model_plate = YOLO(MODEL_PLATE_PATH)
+model_car.to('cpu')
+model_plate.to('cpu')
+
+# โหลด EasyOCR (เน้นภาษาไทย/อังกฤษ) - โหลดครั้งเดียวตอน Start Server
 reader = easyocr.Reader(['th', 'en'], gpu=False)
 
 # ====== 2. นิยามโครงสร้าง Database (ORM) ======
@@ -56,7 +57,7 @@ class CarLog(db.Model):
 with app.app_context():
     db.create_all()
 
-# ====== 3. ตั้งค่าระบบไฟล์ ======
+# ====== 3. ตั้งค่าระบบไฟล์ & ข้อมูลจังหวัด ======
 UPLOAD_FOLDER = "uploads"
 OUTPUT_FOLDER = "static"
 PROVINCES = [
@@ -143,32 +144,48 @@ def update_db_record(img_name, new_car_type, new_plate, new_province):
     return False
 
 def run_ai_processing(img):
-    # แก้จาก width=640 เป็น imgsz=640
-    res_car = model_car(img, imgsz=640, conf=0.7)
-    class_mapping = {"Sedan": "รถเก๋ง", "SUV": "รถอเนกประสงค์", "Ambulance": "รถฉุกเฉิน", "Van": "รถตู้", "Pickup": "รถกระบะ"}
-    car_info = []
-    has_vehicle = False
-    for r in res_car:
-        if len(r.boxes) > 0:
-            has_vehicle = True
-            for box in r.boxes:
-                name = model_car.names[int(box.cls[0])]
-                car_info.append(class_mapping.get(name, name))
+    # ลดขนาดภาพลงเล็กน้อยก่อนเข้า AI เพื่อประหยัด RAM (สำคัญมากสำหรับ Render)
+    h, w = img.shape[:2]
+    img_input = cv2.resize(img, (640, int(h * (640/w)))) if w > 640 else img
+
+    with torch.no_grad(): # ปิด gradient เพื่อประหยัด RAM
+        # ตรวจสอบรถ (ใช้ imgsz=320 เพื่อลดการใช้ RAM)
+        res_car = model_car(img_input, imgsz=320, conf=0.7, verbose=False)
+        
+        class_mapping = {"Sedan": "รถเก๋ง", "SUV": "รถอเนกประสงค์", "Ambulance": "รถฉุกเฉิน", "Van": "รถตู้", "Pickup": "รถกระบะ"}
+        car_info = []
+        has_vehicle = False
+        
+        for r in res_car:
+            if len(r.boxes) > 0:
+                has_vehicle = True
+                for box in r.boxes:
+                    name = model_car.names[int(box.cls[0])]
+                    car_info.append(class_mapping.get(name, name))
+        
+        if has_vehicle:
+            plate_no, province, plate_crop_img = "", "", None
+            # ตรวจสอบป้ายทะเบียน (imgsz=320)
+            res_plate = model_plate(img_input, imgsz=320, conf=0.5, verbose=False)
+            
+            for r in res_plate:
+                for box in r.boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    pad = 10
+                    plate_crop = img_input[max(0, y1-pad):min(img_input.shape[0], y2+pad), 
+                                           max(0, x1-pad):min(img_input.shape[1], x2+pad)]
+                    if plate_crop.size > 0:
+                        plate_crop_img = plate_crop
+                        ocr_res = reader.readtext(plate_crop, detail=0, paragraph=True)
+                        plate_no, province = advanced_thai_fixer("".join(ocr_res))
+                        break
+            
+            # ล้างหน่วยความจำทันที
+            del res_car, res_plate
+            gc.collect()
+            return car_info, plate_no, province, plate_crop_img
     
-    if has_vehicle:
-        plate_no, province, plate_crop_img = "", "", None
-        res_plate = model_plate(img, conf=0.5)
-        for r in res_plate:
-            for box in r.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                pad = 15
-                plate_crop = img[max(0, y1-pad):min(img.shape[0], y2+pad), max(0, x1-pad):min(img.shape[1], x2+pad)]
-                if plate_crop.size > 0:
-                    plate_crop_img = plate_crop
-                    ocr_res = reader.readtext(plate_crop, detail=0, paragraph=True)
-                    plate_no, province = advanced_thai_fixer("".join(ocr_res))
-                    break
-        return car_info, plate_no, province, plate_crop_img
+    gc.collect()
     return None
 
 # ====== 5. เส้นทางหลัก (Routes) ======
@@ -184,22 +201,20 @@ def index():
             upload_path = os.path.join(UPLOAD_FOLDER, temp_name)
             file.save(upload_path)
             img = cv2.imread(upload_path)
-            if img is None: return "ไฟล์ภาพไม่สมบูรณ์"
-            
-            result = run_ai_processing(img)
-            if result:
-                car_info, plate_no, province, plate_crop_img = result
-                image_name = temp_name
-                if plate_crop_img is not None:
-                    plate_zoom_name = "zoom_" + image_name
-                    cv2.imwrite(os.path.join(OUTPUT_FOLDER, plate_zoom_name), plate_crop_img)
-                
-                final_car = car_info[0] if car_info else "ไม่ระบุ"
-                save_to_db(final_car, plate_no, province, image_name, img, plate_crop_img)
-                cv2.imwrite(os.path.join(OUTPUT_FOLDER, image_name), img)
-            else:
-                if os.path.exists(upload_path): os.remove(upload_path)
-                image_name = None
+            if img is not None:
+                result = run_ai_processing(img)
+                if result:
+                    car_info, plate_no, province, plate_crop_img = result
+                    image_name = temp_name
+                    if plate_crop_img is not None:
+                        plate_zoom_name = "zoom_" + image_name
+                        cv2.imwrite(os.path.join(OUTPUT_FOLDER, plate_zoom_name), plate_crop_img)
+                    
+                    final_car = car_info[0] if car_info else "ไม่ระบุ"
+                    save_to_db(final_car, plate_no, province, image_name, img, plate_crop_img)
+                    cv2.imwrite(os.path.join(OUTPUT_FOLDER, image_name), img)
+                else:
+                    if os.path.exists(upload_path): os.remove(upload_path)
 
     return render_template("index.html", image=image_name, plate_zoom=plate_zoom_name, car_info=car_info, plate_no=plate_no, province=province, history=get_history())
 
@@ -208,21 +223,19 @@ def detect_vehicle_only():
     try:
         data = request.json
         image_data = data.get("image")
-        if not image_data or "," not in image_data:
-            return jsonify({"vehicle_detected": False})
+        if not image_data or "," not in image_data: return jsonify({"vehicle_detected": False})
 
-        header, encoded = image_data.split(",", 1)
-        data_bytes = base64.b64decode(encoded)
-        nparr = np.frombuffer(data_bytes, np.uint8)
+        encoded = image_data.split(",", 1)[1]
+        nparr = np.frombuffer(base64.b64decode(encoded), np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
-        if img is None: return jsonify({"vehicle_detected": False})
-
-        # แก้จาก width=640 เป็น imgsz=640
-        results = model_car(img, imgsz=640, conf=0.75, verbose=False)
-        detected = any(len(r.boxes) > 0 for r in results)
+        with torch.no_grad():
+            results = model_car(img, imgsz=320, conf=0.75, verbose=False)
+            detected = any(len(r.boxes) > 0 for r in results)
+        
+        gc.collect()
         return jsonify({"vehicle_detected": detected})
-    except Exception as e:
+    except:
         return jsonify({"vehicle_detected": False})
 
 @app.route("/upload-base64", methods=["POST"])
@@ -230,19 +243,14 @@ def upload_base64():
     try:
         data = request.json
         image_data = data.get("image")
-        if not image_data or "," not in image_data:
-            return jsonify({"status": "no_vehicle_detected"})
+        if not image_data or "," not in image_data: return jsonify({"status": "no_vehicle_detected"})
 
-        header, encoded = image_data.split(",", 1)
-        data_bytes = base64.b64decode(encoded)
-        nparr = np.frombuffer(data_bytes, np.uint8)
+        encoded = image_data.split(",", 1)[1]
+        nparr = np.frombuffer(base64.b64decode(encoded), np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
-        if img is None: return jsonify({"status": "no_vehicle_detected"})
-        
         result = run_ai_processing(img)
-        if result is None:
-            return jsonify({"status": "no_vehicle_detected"})
+        if result is None: return jsonify({"status": "no_vehicle_detected"})
 
         car_info, plate_no, province, plate_crop_img = result
         image_name = str(uuid.uuid4()) + ".jpg"
