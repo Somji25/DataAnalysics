@@ -14,31 +14,31 @@ from flask_sqlalchemy import SQLAlchemy
 from ultralytics import YOLO
 from thefuzz import process
 
-# บังคับให้ YOLO ทำงานแบบ Offline ไม่ต้องเช็คการอัปเดตหรือดาวน์โหลดเพิ่ม
+# บังคับให้ YOLO ทำงานแบบ Offline
 os.environ['YOLO_OFFLINE'] = 'True'
 
 app = Flask(__name__)
 
 # ====== 1. ตั้งค่าฐานข้อมูล PostgreSQL ======
-
 db_url = os.getenv('DATABASE_URL')
 if db_url:
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
     app.config['SQLALCHEMY_DATABASE_URI'] = db_url
 else:
+    # กรณีรัน Local หรือไม่ได้ตั้งค่า Env
     app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://car_detection_db_user:PSf3eBnctkAHjigt6NejbtrCpuopVwL1@dpg-d75nnnruibrs73br3dkg-a.singapore-postgres.render.com/car_detection_db'
 
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-# เตรียมตัวแปรสำหรับโมเดล (จะโหลดเมื่อมีการใช้งานครั้งแรกเพื่อเลี่ยง Timed Out)
+# เตรียมตัวแปรสำหรับโมเดล (Lazy Loading)
 model_car = None
 model_plate = None
 reader = None
 
 def load_models():
-    """ฟังก์ชันสำหรับ Lazy Loading โมเดล เพื่อให้แอปเปิด Port ได้ไวขึ้น และรันแบบ Offline"""
+    """โหลดโมเดลเมื่อจำเป็น และบังคับใช้ CPU เพื่อประหยัด RAM บน Render"""
     global model_car, model_plate, reader
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     
@@ -49,19 +49,14 @@ def load_models():
         model_plate = YOLO(os.path.join(BASE_DIR, "models", "License.pt"))
         model_plate.to('cpu')
     if reader is None:
-        # ระบุ Path ไปยังโฟลเดอร์ที่เราเตรียมโมเดลไว้จาก install_models.py
         model_storage_path = os.path.join(BASE_DIR, "easyocr_models")
-        
-        # โหลด EasyOCR โดยปิดระบบ Download (Offline Mode)
-        # หากรันครั้งแรกแล้วหาไฟล์ไม่เจอ จะไม่ออกเน็ตไปโหลดเองเพื่อกัน Timeout
         reader = easyocr.Reader(['th', 'en'], 
                                 gpu=False, 
                                 model_storage_directory=model_storage_path,
                                 download_enabled=False)
-        print("✅ EasyOCR loaded in Offline Mode")
+        print("✅ Models loaded successfully")
 
-# ====== 2. นิยามโครงสร้าง Database (ORM) ======
-
+# ====== 2. โครงสร้าง Database ======
 class CarLog(db.Model):
     __tablename__ = 'car_logs'
     id = db.Column(db.Integer, primary_key=True)
@@ -92,18 +87,16 @@ PROVINCES = [
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-# ====== 4. ฟังก์ชันจัดการข้อมูล (Helper Functions) ======
-
+# ====== 4. Helper Functions ======
 def convert_cv2_to_base64(img_array):
     if img_array is None: return None
     try:
-        _, buffer = cv2.imencode('.jpg', img_array)
+        _, buffer = cv2.imencode('.jpg', img_array, [cv2.IMWRITE_JPEG_QUALITY, 60])
         return base64.b64encode(buffer).decode('utf-8')
-    except:
-        return None
+    except: return None
 
 def advanced_thai_fixer(raw_text):
-    if not raw_text: return "อ่านไม่ได้", ""
+    if not raw_text: return "อ่านไม่ได้", "ไม่ทราบจังหวัด"
     clean_raw = re.sub(r'[^ก-ฮ0-9]', '', raw_text)
     numbers = re.findall(r'\d+', clean_raw)
     chars = re.findall(r'[ก-ฮ]+', clean_raw)
@@ -152,60 +145,53 @@ def save_to_db(car_type, plate_no, province, img_name, full_img, plate_img):
     db.session.add(new_log)
     db.session.commit()
 
-def update_db_record(img_name, new_car_type, new_plate, new_province):
-    record = CarLog.query.filter_by(image_name=os.path.basename(img_name)).first()
-    if record:
-        record.car_type = new_car_type
-        record.plate_number = new_plate
-        record.province = new_province
-        db.session.commit()
-        return True
-    return False
-
+# ====== 5. AI Core Processing (ปรับปรุงเพื่อแก้ Error 502) ======
 def run_ai_processing(img):
-    load_models() # ตรวจสอบการโหลดโมเดลก่อนประมวลผล
+    load_models()
     h, w = img.shape[:2]
-    img_input = cv2.resize(img, (640, int(h * (640/w)))) if w > 640 else img
+    # ลดขนาดภาพเหลือ 320px เพื่อประหยัด RAM ขั้นสุด
+    input_size = 320
+    img_input = cv2.resize(img, (input_size, int(h * (input_size/w)))) if w > input_size else img
+
+    car_info = []
+    plate_no, province, plate_crop_img = "ไม่พบข้อมูล", "ไม่ทราบจังหวัด", None
+    has_vehicle = False
 
     with torch.no_grad():
-        res_car = model_car(img_input, imgsz=320, conf=0.7, verbose=False)
-        
+        # ขั้นตอนที่ 1: ตรวจสอบรถ
+        res_car = model_car(img_input, imgsz=160, conf=0.7, verbose=False)
         class_mapping = {"Sedan": "รถเก๋ง", "SUV": "รถอเนกประสงค์", "Ambulance": "รถฉุกเฉิน", "Van": "รถตู้", "Pickup": "รถกระบะ"}
-        car_info = []
-        has_vehicle = False
         
-        for r in res_car:
-            if len(r.boxes) > 0:
-                has_vehicle = True
-                for box in r.boxes:
-                    name = model_car.names[int(box.cls[0])]
-                    car_info.append(class_mapping.get(name, name))
+        if len(res_car) > 0 and len(res_car[0].boxes) > 0:
+            has_vehicle = True
+            for box in res_car[0].boxes:
+                name = model_car.names[int(box.cls[0])]
+                car_info.append(class_mapping.get(name, name))
         
+        # คืน RAM ทันที
+        del res_car
+        gc.collect()
+
+        # ขั้นตอนที่ 2: ตรวจสอบป้ายทะเบียน (รันต่อเมื่อเจอรถ)
         if has_vehicle:
-            plate_no, province, plate_crop_img = "", "", None
-            res_plate = model_plate(img_input, imgsz=320, conf=0.5, verbose=False)
-            
+            res_plate = model_plate(img_input, imgsz=160, conf=0.5, verbose=False)
             for r in res_plate:
                 for box in r.boxes:
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    pad = 10
+                    pad = 5
                     plate_crop = img_input[max(0, y1-pad):min(img_input.shape[0], y2+pad), 
                                            max(0, x1-pad):min(img_input.shape[1], x2+pad)]
                     if plate_crop.size > 0:
                         plate_crop_img = plate_crop
-                        ocr_res = reader.readtext(plate_crop, detail=0, paragraph=True)
+                        ocr_res = reader.readtext(plate_crop, detail=0)
                         plate_no, province = advanced_thai_fixer("".join(ocr_res))
                         break
-            
-            del res_car, res_plate
+            del res_plate
             gc.collect()
-            return car_info, plate_no, province, plate_crop_img
-    
-    gc.collect()
-    return None
 
-# ====== 5. เส้นทางหลัก (Routes) ======
+    return car_info, plate_no, province, plate_crop_img
 
+# ====== 6. Routes ======
 @app.route("/", methods=["GET", "POST"])
 def index():
     image_name, plate_zoom_name, car_info = None, None, []
@@ -228,7 +214,7 @@ def index():
                     
                     final_car = car_info[0] if car_info else "ไม่ระบุ"
                     save_to_db(final_car, plate_no, province, image_name, img, plate_crop_img)
-                    cv2.imwrite(os.path.join(OUTPUT_FOLDER, image_name), img)
+                    cv2.imwrite(os.path.join(OUTPUT_FOLDER, image_name), img, [cv2.IMWRITE_JPEG_QUALITY, 50])
                 else:
                     if os.path.exists(upload_path): os.remove(upload_path)
 
@@ -241,19 +227,15 @@ def detect_vehicle_only():
         data = request.json
         image_data = data.get("image")
         if not image_data or "," not in image_data: return jsonify({"vehicle_detected": False})
-
         encoded = image_data.split(",", 1)[1]
         nparr = np.frombuffer(base64.b64decode(encoded), np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
         with torch.no_grad():
-            results = model_car(img, imgsz=320, conf=0.75, verbose=False)
+            results = model_car(img, imgsz=160, conf=0.75, verbose=False)
             detected = any(len(r.boxes) > 0 for r in results)
-        
         gc.collect()
         return jsonify({"vehicle_detected": detected})
-    except:
-        return jsonify({"vehicle_detected": False})
+    except: return jsonify({"vehicle_detected": False})
 
 @app.route("/upload-base64", methods=["POST"])
 def upload_base64():
@@ -261,55 +243,34 @@ def upload_base64():
         data = request.json
         image_data = data.get("image")
         if not image_data or "," not in image_data: return jsonify({"status": "no_vehicle_detected"})
-
         encoded = image_data.split(",", 1)[1]
         nparr = np.frombuffer(base64.b64decode(encoded), np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
         result = run_ai_processing(img)
         if result is None: return jsonify({"status": "no_vehicle_detected"})
 
         car_info, plate_no, province, plate_crop_img = result
         image_name = str(uuid.uuid4()) + ".jpg"
-        
         if plate_crop_img is not None:
             cv2.imwrite(os.path.join(OUTPUT_FOLDER, "zoom_" + image_name), plate_crop_img)
         
         final_car = car_info[0] if car_info else "ไม่ระบุ"
         save_to_db(final_car, plate_no, province, image_name, img, plate_crop_img)
-        
-        cv2.imwrite(os.path.join(OUTPUT_FOLDER, image_name), img)
-        cv2.imwrite(os.path.join(UPLOAD_FOLDER, image_name), img)
-        
+        cv2.imwrite(os.path.join(OUTPUT_FOLDER, image_name), img, [cv2.IMWRITE_JPEG_QUALITY, 50])
         return jsonify({"status": "success", "filename": image_name})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)})
+    except Exception as e: return jsonify({"status": "error", "message": str(e)})
 
 @app.route("/update-info", methods=["POST"])
 def update_info():
     img_name = request.form.get("image_name")
-    success = update_db_record(
-        img_name, 
-        request.form.get("car_type"), 
-        request.form.get("plate_no"), 
-        request.form.get("province")
-    )
-    return redirect(url_for('index', saved=1)) if success else ("Error", 500)
-
-@app.route("/view/<filename>")
-def view_history(filename):
-    record = CarLog.query.filter_by(image_name=filename).first()
+    record = CarLog.query.filter_by(image_name=os.path.basename(img_name)).first()
     if record:
-        return render_template(
-            "index.html", 
-            image=record.image_name, 
-            plate_zoom="zoom_"+record.image_name, 
-            car_info=[record.car_type], 
-            plate_no=record.plate_number, 
-            province=record.province, 
-            history=get_history()
-        )
-    return "Not Found", 404
+        record.car_type = request.form.get("car_type")
+        record.plate_number = request.form.get("plate_no")
+        record.province = request.form.get("province")
+        db.session.commit()
+        return redirect(url_for('index', saved=1))
+    return ("Error", 500)
 
 @app.route("/dashboard")
 def dashboard():
@@ -317,7 +278,6 @@ def dashboard():
     query = CarLog.query
     if sel_date:
         query = query.filter(db.func.date(CarLog.timestamp) == sel_date)
-    
     all_records = query.all()
     total = len(all_records)
     ct_counts = collections.Counter([r.car_type for r in all_records])
