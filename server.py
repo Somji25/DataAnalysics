@@ -14,9 +14,12 @@ from flask_sqlalchemy import SQLAlchemy
 from ultralytics import YOLO
 from thefuzz import process
 
+# บังคับให้ YOLO ทำงานแบบ Offline ไม่ต้องเช็คการอัปเดตหรือดาวน์โหลดเพิ่ม
+os.environ['YOLO_OFFLINE'] = 'True'
+
 app = Flask(__name__)
 
-# ====== 1. ตั้งค่าฐานข้อมูล PostgreSQL & โมเดล ======
+# ====== 1. ตั้งค่าฐานข้อมูล PostgreSQL ======
 
 db_url = os.getenv('DATABASE_URL')
 if db_url:
@@ -29,17 +32,25 @@ else:
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-# โหลดโมเดล AI และบังคับใช้ CPU (ประหยัด RAM กว่า GPU บน Server ฟรี)
-MODEL_CAR_PATH = os.path.join("models", "best.pt")
-MODEL_PLATE_PATH = os.path.join("models", "License.pt")
+# เตรียมตัวแปรสำหรับโมเดล (จะโหลดเมื่อมีการใช้งานครั้งแรกเพื่อเลี่ยง Timed Out)
+model_car = None
+model_plate = None
+reader = None
 
-model_car = YOLO(MODEL_CAR_PATH) 
-model_plate = YOLO(MODEL_PLATE_PATH)
-model_car.to('cpu')
-model_plate.to('cpu')
-
-# โหลด EasyOCR (เน้นภาษาไทย/อังกฤษ) - โหลดครั้งเดียวตอน Start Server
-reader = easyocr.Reader(['th', 'en'], gpu=False)
+def load_models():
+    """ฟังก์ชันสำหรับ Lazy Loading โมเดล เพื่อให้แอปเปิด Port ได้ไวขึ้น"""
+    global model_car, model_plate, reader
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    
+    if model_car is None:
+        model_car = YOLO(os.path.join(BASE_DIR, "models", "best.pt"))
+        model_car.to('cpu')
+    if model_plate is None:
+        model_plate = YOLO(os.path.join(BASE_DIR, "models", "License.pt"))
+        model_plate.to('cpu')
+    if reader is None:
+        # โหลด EasyOCR เฉพาะตอนจะใช้จริง
+        reader = easyocr.Reader(['th', 'en'], gpu=False)
 
 # ====== 2. นิยามโครงสร้าง Database (ORM) ======
 
@@ -144,12 +155,11 @@ def update_db_record(img_name, new_car_type, new_plate, new_province):
     return False
 
 def run_ai_processing(img):
-    # ลดขนาดภาพลงเล็กน้อยก่อนเข้า AI เพื่อประหยัด RAM (สำคัญมากสำหรับ Render)
+    load_models() # ตรวจสอบการโหลดโมเดลก่อนประมวลผล
     h, w = img.shape[:2]
     img_input = cv2.resize(img, (640, int(h * (640/w)))) if w > 640 else img
 
-    with torch.no_grad(): # ปิด gradient เพื่อประหยัด RAM
-        # ตรวจสอบรถ (ใช้ imgsz=320 เพื่อลดการใช้ RAM)
+    with torch.no_grad():
         res_car = model_car(img_input, imgsz=320, conf=0.7, verbose=False)
         
         class_mapping = {"Sedan": "รถเก๋ง", "SUV": "รถอเนกประสงค์", "Ambulance": "รถฉุกเฉิน", "Van": "รถตู้", "Pickup": "รถกระบะ"}
@@ -165,7 +175,6 @@ def run_ai_processing(img):
         
         if has_vehicle:
             plate_no, province, plate_crop_img = "", "", None
-            # ตรวจสอบป้ายทะเบียน (imgsz=320)
             res_plate = model_plate(img_input, imgsz=320, conf=0.5, verbose=False)
             
             for r in res_plate:
@@ -180,7 +189,6 @@ def run_ai_processing(img):
                         plate_no, province = advanced_thai_fixer("".join(ocr_res))
                         break
             
-            # ล้างหน่วยความจำทันที
             del res_car, res_plate
             gc.collect()
             return car_info, plate_no, province, plate_crop_img
@@ -221,6 +229,7 @@ def index():
 @app.route("/detect-vehicle-only", methods=["POST"])
 def detect_vehicle_only():
     try:
+        load_models()
         data = request.json
         image_data = data.get("image")
         if not image_data or "," not in image_data: return jsonify({"vehicle_detected": False})
