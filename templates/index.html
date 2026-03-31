@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Extractor - Auto Detection</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Sarabun', sans-serif; background-color: #f1f5f9; height: 100vh; overflow: hidden; }
+        .history-scroll { flex: 1; overflow-y: auto; }
+        .history-scroll::-webkit-scrollbar { width: 5px; }
+        .history-scroll::-webkit-scrollbar-track { background: transparent; }
+        .history-scroll::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+        .clickable-row { cursor: pointer; transition: all 0.2s ease; }
+        .clickable-row:hover { background-color: #f8fafc !important; transform: translateX(4px); }
+        
+        #loadingOverlay { 
+            display: none; position: absolute; inset: 0; background: rgba(255,255,255,0.8); 
+            z-index: 50; border-radius: 1.5rem; align-items: center; justify-content: center; backdrop-filter: blur(4px); 
+        }
+        .loader { border: 3px solid #f3f3f3; border-top: 3px solid #2563eb; border-radius: 50%; width: 35px; height: 35px; animation: spin 1s linear infinite; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        
+        .editable-input { border: 1.5px solid transparent; background: #f8fafc; transition: all 0.2s; padding: 0.5rem 1rem; border-radius: 12px; width: 100%; }
+        .editable-input:focus { border-color: #3b82f6; background: #fff; outline: none; box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.1); }
+        #toast.show { transform: translate(-50%, -20px); opacity: 1; }
+        .mode-hidden { display: none !important; }
+        
+        #cameraArea { 
+            position: absolute;
+            inset: 0;
+            background-color: #000;
+            z-index: 10;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        #webcam { width: 100%; height: 100%; object-fit: cover; background: #000; }
+
+        /* Scanning Animation */
+        .scan-line {
+            position: absolute;
+            width: 100%;
+            height: 2px;
+            background: rgba(37, 99, 235, 0.5);
+            box-shadow: 0 0 15px 2px #2563eb;
+            top: 0;
+            z-index: 20;
+            animation: scan 3s linear infinite;
+        }
+        @keyframes scan {
+            0% { top: 0%; }
+            100% { top: 100%; }
+        }
+    </style>
+</head>
+<body class="p-4 lg:p-6 flex flex-col">
+
+    <div class="max-w-[1600px] mx-auto w-full h-full flex flex-col"> 
+        <header class="mb-4 flex justify-between items-end shrink-0">
+            <div>
+                <h1 class="text-2xl font-extrabold text-slate-800 tracking-tight leading-tight">SMART <span class="text-blue-600">EXTRACTOR</span></h1>
+                <p class="text-slate-500 text-[10px] font-bold uppercase tracking-wider">AI-Powered Vehicle Data Extraction System</p>
+            </div>
+            
+            <div class="flex items-center gap-3">
+                <div class="flex bg-white p-1 rounded-2xl shadow-sm border border-slate-200 mr-2">
+                    <button onclick="switchMode('upload')" id="btnUpload" class="px-4 py-2 rounded-xl text-[10px] font-bold uppercase transition-all bg-blue-600 text-white">Upload File</button>
+                    <button onclick="switchMode('camera')" id="btnCamera" class="px-4 py-2 rounded-xl text-[10px] font-bold uppercase transition-all text-slate-400 hover:text-slate-600">Auto Detect</button>
+                </div>
+                <a href="/dashboard" class="flex items-center gap-2 bg-white hover:bg-slate-50 text-slate-600 text-[10px] font-bold px-4 py-2.5 rounded-xl border border-slate-200 transition-all uppercase tracking-wider shadow-sm">
+                    <svg class="w-3.5 h-3.5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2-2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
+                    Dashboard
+                </a>
+            </div>
+        </header>
+
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 flex-1 overflow-hidden">
+            <div class="lg:col-span-9 flex flex-col gap-6 overflow-hidden">
+                <div class="bg-white rounded-[2rem] p-4 shadow-sm border border-slate-200 relative flex flex-col flex-1 min-h-0 overflow-hidden">
+                    <div id="loadingOverlay">
+                        <div class="flex flex-col items-center gap-3">
+                            <div class="loader"></div>
+                            <p class="text-sm font-bold text-slate-600 uppercase tracking-tight">AI Detecting Vehicle...</p>
+                        </div>
+                    </div>
+
+                    <form action="/" method="post" enctype="multipart/form-data" id="uploadForm" class="h-full">
+                        <div id="uploadArea" class="relative group border-2 border-dashed border-slate-100 rounded-3xl h-full transition-all hover:border-blue-400 hover:bg-blue-50/20 flex flex-col items-center justify-center overflow-hidden">
+                            {% if image %}
+                                <img src="{{ url_for('static', filename=image) }}" class="h-full w-full object-contain p-2 rounded-3xl">
+                            {% else %}
+                                <div class="text-center">
+                                    <div class="w-16 h-16 bg-blue-50 text-blue-500 rounded-2xl flex items-center justify-center mx-auto mb-4 group-hover:scale-110 transition-transform">
+                                        <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
+                                    </div>
+                                    <h3 class="text-slate-700 font-bold">อัปโหลดภาพถ่ายรถ</h3>
+                                    <p class="text-slate-400 text-[10px] mt-1 font-medium uppercase tracking-widest">Click to Browse</p>
+                                </div>
+                            {% endif %}
+                            <input type="file" name="image" id="imageInput" class="absolute inset-0 opacity-0 cursor-pointer" onchange="submitWithLoading()">
+                        </div>
+                    </form>
+
+                    <div id="cameraArea" class="mode-hidden">
+                        <div class="scan-line"></div>
+                        <video id="webcam" autoplay playsinline></video>
+                        <canvas id="captureCanvas" class="hidden"></canvas>
+                        
+                        <div class="absolute top-6 left-6 z-20 flex items-center gap-3 bg-black/40 backdrop-blur-md px-4 py-2 rounded-full border border-white/10">
+                            <div class="w-2 h-2 bg-green-500 rounded-full animate-ping"></div>
+                            <span class="text-white text-[10px] font-bold uppercase tracking-widest">AI Vision Active</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="bg-white rounded-[2rem] p-6 shadow-sm border border-slate-200 border-t-4 border-t-blue-600 shrink-0">
+                    <form action="/update-info" method="post" id="updateForm">
+                        <div class="flex justify-between items-center mb-5">
+                            <div class="flex items-center gap-3">
+                                <div class="w-8 h-8 bg-blue-50 rounded-lg flex items-center justify-center text-blue-500">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
+                                </div>
+                                <h2 class="text-xs font-extrabold text-slate-800 uppercase tracking-widest">ข้อมูลที่ตรวจพบ</h2>
+                            </div>
+                            
+                            {% if car_info or plate_no %}
+                            <div class="flex items-center gap-3">
+                                <button type="button" onclick="window.location.href='/'" class="text-slate-400 hover:text-red-500 text-[10px] font-bold uppercase transition-colors px-2">Clear</button>
+                                <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white text-[10px] font-bold px-6 py-2.5 rounded-xl shadow-md shadow-blue-200 transition-all active:scale-95 uppercase tracking-wider">
+                                    Save Record
+                                </button>
+                            </div>
+                            {% endif %}
+                        </div>
+
+                        {% if car_info or plate_no %}
+                        <div class="flex flex-col md:flex-row gap-6">
+                            <div class="w-full md:w-1/3 flex flex-col items-center justify-center bg-slate-50 rounded-2xl p-6 border border-slate-100 shadow-inner">
+                                <span class="text-[10px] font-bold text-slate-400 uppercase mb-3 tracking-widest">Plate AI Zoom</span>
+                                {% if plate_zoom %}
+                                    <img src="{{ url_for('static', filename=plate_zoom) }}" class="h-20 w-auto rounded-lg shadow-md border-2 border-white object-contain">
+                                {% else %}
+                                    <div class="text-slate-300 italic text-[10px]">ไม่พบป้าย</div>
+                                {% endif %}
+                            </div>
+
+                            <div class="flex-1 grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div class="md:col-span-1">
+                                    <label class="text-[10px] font-bold text-slate-400 uppercase mb-1 block ml-1">เลขทะเบียนรถ</label>
+                                    <input type="text" name="plate_no" value="{{ plate_no if plate_no else '' }}" class="editable-input text-3xl font-black text-blue-600 uppercase">
+                                </div>
+                                <div class="md:col-span-1 flex flex-col gap-4">
+                                    <div class="grid grid-cols-2 gap-3">
+                                        <div>
+                                            <label class="text-[10px] font-bold text-slate-400 uppercase mb-1 block ml-1">จังหวัด</label>
+                                            <input type="text" name="province" value="{{ province if province else '' }}" class="editable-input font-bold text-sm text-slate-700">
+                                        </div>
+                                        <div>
+                                            <label class="text-[10px] font-bold text-slate-400 uppercase mb-1 block ml-1">ประเภทรถ</label>
+                                            <select name="car_type" class="editable-input font-bold text-xs text-slate-700 appearance-none">
+                                                <option value="รถเก๋ง" {% if car_info and 'รถเก๋ง' in car_info[0] %}selected{% endif %}>รถเก๋ง (Car)</option>
+                                                <option value="รถกระบะ" {% if car_info and 'รถกระบะ' in car_info[0] %}selected{% endif %}>รถกระบะ (Pickup)</option>
+                                                <option value="รถตู้" {% if car_info and 'รถตู้' in car_info[0] %}selected{% endif %}>รถตู้ (Van)</option>
+                                                <option value="รถอเนกประสงค์" {% if car_info and 'รถอเนกประสงค์' in car_info[0] %}selected{% endif %}>รถ SUV</option>
+                                                <option value="รถฉุกเฉิน" {% if car_info and 'รถฉุกเฉิน' in car_info[0] %}selected{% endif %}>รถฉุกเฉิน</option>
+                                            </select>
+                                        </div>
+                                    </div>
+                                </div>
+                                <input type="hidden" name="image_name" value="{{ image }}">
+                            </div>
+                        </div>
+                        {% else %}
+                        <div class="py-10 text-center border-2 border-dotted border-slate-50 rounded-2xl">
+                            <p class="text-slate-300 text-xs italic font-medium uppercase tracking-widest">Waiting for Image Analysis...</p>
+                        </div>
+                        {% endif %}
+                    </form>
+                </div>
+            </div>
+
+            <div class="lg:col-span-3 flex flex-col overflow-hidden h-full">
+                <div class="bg-white rounded-[2rem] p-6 shadow-sm border border-slate-200 flex flex-col h-full overflow-hidden">
+                    <div class="flex items-center justify-between mb-6 shrink-0">
+                        <h2 class="text-xs font-extrabold text-slate-800 uppercase tracking-widest flex items-center gap-2">
+                            <svg class="w-4 h-4 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                            History
+                        </h2>
+                        <span class="bg-slate-100 text-slate-500 text-[10px] px-2.5 py-1 rounded-full font-bold uppercase">{{ history|length if history else 0 }}</span>
+                    </div>
+
+                    <div class="history-scroll pr-1">
+                        <div class="space-y-3">
+                            {% if history %}
+                                {% for item in history %}
+                                <div class="clickable-row group bg-white border border-slate-100 p-4 rounded-2xl shadow-sm hover:shadow-md hover:border-blue-100" onclick="window.location.href='/view/{{ item.ImageName }}'">
+                                    <div class="flex justify-between items-start mb-2">
+                                        <span class="text-blue-600 font-black text-lg tracking-tight uppercase leading-none">{{ item.PlateNumber }}</span>
+                                        <span class="text-[8px] text-slate-400 font-bold uppercase tracking-tighter">{{ item.Timestamp }}</span>
+                                    </div>
+                                    <div class="flex items-center gap-2">
+                                        <span class="text-[9px] font-bold uppercase px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-600">
+                                            {{ item.CarType }}
+                                        </span>
+                                        <span class="text-[9px] text-slate-400 font-bold uppercase">{{ item.Province }}</span>
+                                    </div>
+                                </div>
+                                {% endfor %}
+                            {% else %}
+                                <div class="text-center py-20 text-slate-300 italic text-sm">ไม่มีประวัติ</div>
+                            {% endif %}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast" class="fixed bottom-10 left-1/2 -translate-x-1/2 z-[100] pointer-events-none opacity-0 transition-all duration-500 transform translate-y-10">
+        <div class="bg-slate-900 text-white px-6 py-3 rounded-2xl shadow-2xl flex items-center gap-3">
+            <div class="bg-green-500 rounded-full p-1">
+                <svg class="w-3 h-3 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"/></svg>
+            </div>
+            <span class="text-xs font-bold uppercase tracking-wider">Saved Successfully</span>
+        </div>
+    </div>
+
+    <script>
+        const video = document.getElementById('webcam');
+        const canvas = document.getElementById('captureCanvas');
+        let stream = null;
+        let detectionActive = false;
+
+        function submitWithLoading() {
+            document.getElementById('loadingOverlay').style.display = 'flex';
+            document.getElementById('uploadForm').submit();
+        }
+
+        async function switchMode(mode) {
+            const uploadArea = document.getElementById('uploadArea');
+            const cameraArea = document.getElementById('cameraArea');
+            const btnU = document.getElementById('btnUpload');
+            const btnC = document.getElementById('btnCamera');
+
+            if (mode === 'camera') {
+                uploadArea.classList.add('mode-hidden');
+                cameraArea.classList.remove('mode-hidden');
+                btnC.className = "px-4 py-2 rounded-xl text-[10px] font-bold uppercase transition-all bg-blue-600 text-white";
+                btnU.className = "px-4 py-2 rounded-xl text-[10px] font-bold uppercase transition-all text-slate-400 hover:text-slate-600";
+                
+                try {
+                    const constraints = {
+                        video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+                        audio: false 
+                    };
+                    stream = await navigator.mediaDevices.getUserMedia(constraints);
+                    video.srcObject = stream;
+                    detectionActive = true;
+                    // เริ่ม Loop ตรวจจับรถ
+                    startDetectionLoop();
+                } catch (err) {
+                    alert("เข้าถึงกล้องไม่ได้: " + err);
+                    switchMode('upload');
+                }
+            } else {
+                detectionActive = false;
+                cameraArea.classList.add('mode-hidden');
+                uploadArea.classList.remove('mode-hidden');
+                btnU.className = "px-4 py-2 rounded-xl text-[10px] font-bold uppercase transition-all bg-blue-600 text-white";
+                btnC.className = "px-4 py-2 rounded-xl text-[10px] font-bold uppercase transition-all text-slate-400 hover:text-slate-600";
+                
+                if (stream) {
+                    stream.getTracks().forEach(track => track.stop());
+                }
+            }
+        }
+
+        // --- Logic ใหม่: ตรวจจับอัตโนมัติ ---
+        async function startDetectionLoop() {
+            if (!detectionActive) return;
+
+            // 1. แคป Frame ปัจจุบันเพื่อส่งไปเช็ค
+            canvas.width = 400; // ใช้ความละเอียดต่ำในการ detect เพื่อความเร็ว
+            canvas.height = (video.videoHeight / video.videoWidth) * 400;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            const base64Image = canvas.toDataURL('image/jpeg', 0.5);
+
+            try {
+                // 2. ส่งไปให้ API ตรวจสอบว่า "มีรถอยู่หรือไม่" (Detect Vehicle)
+                const response = await fetch('/detect-vehicle-only', { 
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ image: base64Image })
+                });
+                const result = await response.json();
+
+                // 3. ถ้าพบรถ ให้ทำการแคปภาพจริงความละเอียดสูงและส่งวิเคราะห์
+                if (result.vehicle_detected) {
+                    detectionActive = false; // หยุด detect ชั่วคราวเพื่อประมวลผล
+                    takeFinalSnapshot();
+                } else {
+                    // ถ้าไม่เจอก็รอ 1 วินาทีแล้วหาใหม่
+                    setTimeout(startDetectionLoop, 1000);
+                }
+            } catch (err) {
+                console.error("Detection Error:", err);
+                setTimeout(startDetectionLoop, 2000);
+            }
+        }
+
+        async function takeFinalSnapshot() {
+            document.getElementById('loadingOverlay').style.display = 'flex';
+            
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            const highResImage = canvas.toDataURL('image/jpeg', 0.9);
+            
+            try {
+                const response = await fetch('/upload-base64', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ image: highResImage })
+                });
+                const result = await response.json();
+                if(result.status === 'success') {
+                    window.location.reload(); // โหลดหน้าใหม่เพื่อแสดงข้อมูลรถที่แคปได้
+                }
+            } catch (err) {
+                console.error(err);
+                document.getElementById('loadingOverlay').style.display = 'none';
+                detectionActive = true;
+                startDetectionLoop(); // กลับไปหาต่อถ้า Error
+            }
+        }
+
+        window.onload = function() {
+            const urlParams = new URLSearchParams(window.location.search);
+            if (urlParams.has('saved')) {
+                const toast = document.getElementById('toast');
+                toast.classList.add('show');
+                setTimeout(() => toast.classList.remove('show'), 3000);
+            }
+        };
+    </script>
+</body>
+</html>
