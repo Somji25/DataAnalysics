@@ -3,7 +3,7 @@ flask-sqlalchemy
 psycopg2-binary
 ultralytics
 opencv-python-headless
-easyocr
-numpy
+easyocr==1.7.1
+numpy<2.0.0
 thefuzz
 python-Levenshtein
