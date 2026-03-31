@@ -26,6 +26,7 @@ if db_url:
         db_url = db_url.replace("postgres://", "postgresql://", 1)
     app.config['SQLALCHEMY_DATABASE_URI'] = db_url
 else:
+    # ค่า Default สำหรับทดสอบ
     app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://car_detection_db_user:PSf3eBnctkAHjigt6NejbtrCpuopVwL1@dpg-d75nnnruibrs73br3dkg-a.singapore-postgres.render.com/car_detection_db'
 
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -37,7 +38,7 @@ model_plate = None
 reader = None
 
 def load_models():
-    """โหลดโมเดลเมื่อจำเป็นเท่านั้น และบังคับใช้ CPU"""
+    """โหลดโมเดลเมื่อจำเป็นเท่านั้น และบังคับใช้ CPU พร้อมจัดการ Memory"""
     global model_car, model_plate, reader
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     
@@ -46,8 +47,8 @@ def load_models():
     if model_plate is None:
         model_plate = YOLO(os.path.join(BASE_DIR, "models", "License.pt")).to('cpu')
     if reader is None:
-        # ระบุโฟลเดอร์เก็บโมเดลเพื่อป้องกันการดาวน์โหลดใหม่ทุกครั้ง
         model_storage_path = os.path.join(BASE_DIR, "easyocr_models")
+        # โหลด EasyOCR โดยปิดการใช้ GPU เพื่อประหยัด RAM บน Render
         reader = easyocr.Reader(['th', 'en'], gpu=False, model_storage_directory=model_storage_path)
 
 # ====== 2. โครงสร้าง Database (ORM) ======
@@ -85,7 +86,6 @@ os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 def convert_cv2_to_base64(img_array):
     if img_array is None: return None
     try:
-        # ปรับ Quality เป็น 60 เพื่อประหยัดพื้นที่ Database
         _, buffer = cv2.imencode('.jpg', img_array, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
         return base64.b64encode(buffer).decode('utf-8')
     except: return None
@@ -131,18 +131,19 @@ def get_history():
         'PlateImageBase64': r.plate_image_base64
     } for r in records]
 
-# ====== 5. AI Processing (Optimized for Render) ======
+# ====== 5. AI Processing ======
 def run_ai_processing(img):
     load_models()
     h, w = img.shape[:2]
-    # Resize ภาพเข้า AI ให้เล็กลง (320-480px) เพื่อป้องกัน RAM เต็ม
-    img_input = cv2.resize(img, (480, int(h * (480/w)))) if w > 480 else img
+    # ปรับขนาดภาพให้เล็กลง (320px) เพื่อประหยัด CPU/RAM บน Cloud
+    target_size = 320
+    img_input = cv2.resize(img, (target_size, int(h * (target_size/w)))) if w > target_size else img
 
     car_info = []
     has_vehicle = False
     
     with torch.no_grad():
-        res_car = model_car(img_input, imgsz=320, conf=0.7, verbose=False)
+        res_car = model_car(img_input, imgsz=target_size, conf=0.7, verbose=False)
         if len(res_car) > 0 and len(res_car[0].boxes) > 0:
             has_vehicle = True
             class_mapping = {"Sedan": "รถเก๋ง", "SUV": "รถอเนกประสงค์", "Ambulance": "รถฉุกเฉิน", "Van": "รถตู้", "Pickup": "รถกระบะ"}
@@ -150,24 +151,23 @@ def run_ai_processing(img):
                 name = model_car.names[int(box.cls[0])]
                 car_info.append(class_mapping.get(name, name))
         
-        # ล้าง RAM หลังรันโมเดลแรก
         del res_car
         gc.collect()
 
         if has_vehicle:
             plate_no, province, plate_crop_img = "", "", None
-            res_plate = model_plate(img_input, imgsz=320, conf=0.5, verbose=False)
+            res_plate = model_plate(img_input, imgsz=target_size, conf=0.5, verbose=False)
             
             for r in res_plate:
                 for box in r.boxes:
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    pad = 10
+                    pad = 5
                     plate_crop = img_input[max(0, y1-pad):min(img_input.shape[0], y2+pad), 
                                            max(0, x1-pad):min(img_input.shape[1], x2+pad)]
                     if plate_crop.size > 0:
                         plate_crop_img = plate_crop
-                        # ลดขนาดภาพป้ายทะเบียนก่อนส่งให้ OCR เพื่อความเร็ว
-                        ocr_res = reader.readtext(cv2.resize(plate_crop, (0,0), fx=0.8, fy=0.8), detail=0)
+                        # ลดความละเอียดก่อน OCR เพื่อความเร็ว
+                        ocr_res = reader.readtext(cv2.resize(plate_crop, (0,0), fx=0.7, fy=0.7), detail=0)
                         plate_no, province = advanced_thai_fixer("".join(ocr_res))
                         break
             
@@ -289,6 +289,9 @@ def dashboard():
     }
     return render_template("dashboard.html", chart_data=chart, total=len(all_records), selected_date=sel_date)
 
+# ====== 7. Main Runner (Configured for Render) ======
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(debug=False, host='0.0.0.0', port=port)
+    # บังคับใช้พอร์ตจาก Environment Variable ที่ Render กำหนด
+    # และใช้ host 0.0.0.0 เพื่อให้เข้าถึงจากภายนอกได้
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port, debug=False)
