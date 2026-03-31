@@ -38,7 +38,7 @@ model_plate = None
 reader = None
 
 def load_models():
-    """ฟังก์ชันสำหรับ Lazy Loading โมเดล เพื่อให้แอปเปิด Port ได้ไวขึ้น"""
+    """ฟังก์ชันสำหรับ Lazy Loading โมเดล เพื่อให้แอปเปิด Port ได้ไวขึ้น และรันแบบ Offline"""
     global model_car, model_plate, reader
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     
@@ -49,8 +49,16 @@ def load_models():
         model_plate = YOLO(os.path.join(BASE_DIR, "models", "License.pt"))
         model_plate.to('cpu')
     if reader is None:
-        # โหลด EasyOCR เฉพาะตอนจะใช้จริง
-        reader = easyocr.Reader(['th', 'en'], gpu=False)
+        # ระบุ Path ไปยังโฟลเดอร์ที่เราเตรียมโมเดลไว้จาก install_models.py
+        model_storage_path = os.path.join(BASE_DIR, "easyocr_models")
+        
+        # โหลด EasyOCR โดยปิดระบบ Download (Offline Mode)
+        # หากรันครั้งแรกแล้วหาไฟล์ไม่เจอ จะไม่ออกเน็ตไปโหลดเองเพื่อกัน Timeout
+        reader = easyocr.Reader(['th', 'en'], 
+                                gpu=False, 
+                                model_storage_directory=model_storage_path,
+                                download_enabled=False)
+        print("✅ EasyOCR loaded in Offline Mode")
 
 # ====== 2. นิยามโครงสร้าง Database (ORM) ======
 
