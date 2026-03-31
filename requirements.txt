@@ -1,9 +1,10 @@
-flask
-flask-sqlalchemy
+Flask
+Flask-SQLAlchemy
 ultralytics
 easyocr
-opencv-python-headless
-torch --index-url https://download.pytorch.org/whl/cpu
-torchvision --index-url https://download.pytorch.org/whl/cpu
-thefuzz
+psycopg2-binary
 gunicorn
+thefuzz
+torch
+numpy
+opencv-python-headless
