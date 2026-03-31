@@ -3,7 +3,8 @@ flask-sqlalchemy
 psycopg2-binary
 ultralytics
 opencv-python-headless
-easyocr==1.7.1
-numpy<2.0.0
+easyocr
+torch --index-url https://download.pytorch.org/whl/cpu
+torchvision --index-url https://download.pytorch.org/whl/cpu
 thefuzz
 python-Levenshtein
