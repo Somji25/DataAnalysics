@@ -1,0 +1,9 @@
+flask
+flask-sqlalchemy
+psycopg2-binary
+ultralytics
+opencv-python-headless
+easyocr
+numpy
+thefuzz
+python-Levenshtein
